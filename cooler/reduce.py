@@ -12,6 +12,7 @@ import pandas as pd
 import numpy as np
 import h5py
 
+from ._version import __format_version_mcool__
 from ._logging import get_logger
 from .create import ContactBinner, create
 from .util import parse_cooler_uri, GenomeSegmentation
@@ -131,9 +132,8 @@ class CoolerMerger(ContactBinner):
         else:
             bins = coolers[0].bins()[["chrom", "start", "end"]][:]
             for i in range(1, len(coolers)):
-                if not np.all(
-                    coolers[i].bins()[["chrom", "start", "end"]][:] == bins
-                ):  # noqa
+                bins2 = coolers[i].bins()[["chrom", "start", "end"]][:]
+                if (len(bins2) != len(bins)) or not np.all(bins2 == bins):
                     raise ValueError("Coolers must have same bin structure")
 
     def __iter__(self):
@@ -206,6 +206,11 @@ def merge_coolers(
     kwargs
         Passed to ``cooler.create``.
 
+    Notes
+    -----
+    The default output file mode is 'w'. If appending output to an existing
+    file, pass `mode='a'`.
+
     See also
     --------
     cooler.coarsen_cooler
@@ -225,7 +230,7 @@ def merge_coolers(
     elif not any(is_symm):
         symmetric_upper = False
     else:
-        ValueError("Cannot merge symmetric and non-symmetric coolers.")
+        raise ValueError("Cannot merge symmetric and non-symmetric coolers.")
 
     if columns is None:
         columns = ["count"]
@@ -264,7 +269,7 @@ def merge_coolers(
     )
 
 
-def _optimal_prune_partition(edges, maxlen):
+def _optimal_prune_partition(edges, maxlen):  # pragma: no cover
     """Given an integer interval partition ``edges``, find the coarsened
     partition with the longest subintervals such that no new subinterval
     created by removing edges exceeds ``maxlen``.
@@ -336,6 +341,97 @@ def get_quadtree_depth(chromsizes, base_binsize, bins_per_tile):
     n_zoom_levels = int(math.ceil(np.log2(n_tiles)))
 
     return n_zoom_levels
+
+
+def geomprog(start, mul):
+    """
+    Generate a geometric progression of integers.
+
+    Beginning with integer ``start``, yield an unbounded geometric progression
+    with integer ratio ``mul``.
+
+    """
+    start, mul = int(start), int(mul)
+    yield start
+    while True:
+        start *= mul
+        yield start
+
+
+def niceprog(start):
+    """
+    Generate a nice progression of integers.
+
+    Beginning with integer ``start``, yield a sequence of "nicely" spaced
+    integers: an unbounded geometric progression with ratio 10, interspersed
+    with steps of ratios 2 and 5.
+
+    """
+    start = int(start)
+    yield start
+    while True:
+        for mul in (2, 5, 10):
+            yield start * mul
+        start *= 10
+
+
+def preferred_sequence(start, stop, style='nice'):
+    """
+    Return a sequence of integers with a "preferred" stepping pattern.
+
+    Parameters
+    ----------
+    start : int
+        Starting value in the progression.
+    stop : int
+        Upper bound of progression, inclusive. Values will not exceed this.
+    style : {'nice', 'binary'}
+        Style of progression. 'nice' gives geometric steps of 10 with 2 and 5
+        in between. 'binary' gives geometric steps of 2.
+
+    Returns
+    ------
+    list of int
+
+    Examples
+    --------
+    For certain values of `start` (n * 10^i), nice stepping produces familiar
+    "preferred" sequences [1]_:
+
+    Note denominations in Dollars (1-2-5)
+
+        >>> preferred_sequence(1, 100, 'nice')
+        [1, 2, 5, 10, 20, 50, 100]
+
+
+    Coin denominations in Cents
+
+        >>> preferred_sequence(5, 100, 'nice')
+        [5, 10, 25, 50, 100]
+
+    .. [1] https://en.wikipedia.org/wiki/Preferred_number#1-2-5_series
+
+    """
+    if start > stop:
+        return []
+
+    if style == 'binary':
+        gen = geomprog(start, 2)
+    elif style == 'nice':
+        gen = niceprog(start)
+    else:
+        ValueError(
+            "Expected style value of 'binary' or 'nice'; got '{}'.".format(style)
+        )
+
+    seq = [next(gen)]
+    while True:
+        n = next(gen)
+        if n > stop:
+            break
+        seq.append(n)
+
+    return seq
 
 
 def get_multiplier_sequence(resolutions, bases=None):
@@ -505,7 +601,7 @@ class CoolerCoarsener(ContactBinner):
     def aggregate(self, span):
         try:
             chunk = self._aggregate(span)
-        except MemoryError as e:
+        except MemoryError as e:  # pragma: no cover
             raise RuntimeError(str(e))
         return chunk
 
@@ -600,7 +696,7 @@ def coarsen_cooler(
                 "input '{}'.".format(col, clr.filename)
             )
         else:
-            dtypes[col] = input_dtypes[col]
+            dtypes.setdefault(col, input_dtypes[col])
 
     try:
         # Note: fork before opening to prevent inconsistent global HDF5 state
@@ -756,7 +852,10 @@ def zoomify_cooler(
         )
 
     with h5py.File(outfile, "r+") as fw:
-        fw.attrs.update({"format": u"HDF5::MCOOL", "format-version": 2})
+        fw.attrs.update({
+            "format": u"HDF5::MCOOL",
+            "format-version": __format_version_mcool__
+        })
 
 
 def legacy_zoomify(input_uri, outfile, nproc, chunksize, lock=None):

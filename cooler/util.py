@@ -357,8 +357,11 @@ def digest(fasta_records, enzyme):
         Dataframe with columns: ``chrom``, ``start``, ``end``.
 
     """
-    import Bio.Restriction as biorst
-    import Bio.Seq as bioseq
+    try:
+        import Bio.Restriction as biorst
+        import Bio.Seq as bioseq
+    except ImportError:
+        raise ImportError("Biopython is required to find restriction fragments.")
 
     # http://biopython.org/DIST/docs/cookbook/Restriction.html#mozTocId447698
     chroms = fasta_records.keys()
@@ -433,65 +436,6 @@ def bedslice(grouped, chromsizes, region):
         hi = lo + result["start"].values[lo:].searchsorted(end, side="left")
         result = result.iloc[lo:hi]
     return result
-
-
-def lexbisect(arrays, values, side="left", lo=0, hi=None):
-    """
-    Bisection search on lexically sorted arrays.
-
-    Parameters
-    ----------
-    arrays : sequence of k 1-D array-like
-        Each "array" can be any sequence that supports scalar integer indexing.
-        The arrays are assumed to have the same length and values lexsorted
-        from left to right.
-    values : sequence of k values
-        Values that would be inserted into the arrays.
-    side : {'left', 'right'}, optional
-        If ‘left’, the index of the first suitable location found is given.
-        If ‘right’, return the last such index. If there is no suitable index,
-        return either 0 or N (where N is the length of each array).
-    lo, hi : int, optional
-        Bound the slice to be searched (default 'lo' is 0 and 'hi' is N).
-
-    Returns
-    -------
-    i : int
-        Insertion index.
-
-    Examples
-    --------
-    >>> h5 = h5py.File('mytable.h5', 'r')  # doctest: +SKIP
-    >>> lexbisect([h5['chrom'], h5['start']], [1, 100000], side='right')  # doctest: +SKIP
-    2151688
-
-    """
-    arrays = tuple(arrays)
-    values = tuple(values)
-
-    if lo < 0:
-        raise ValueError("lo must be non-negative")
-    if hi is None:
-        hi = len(arrays[0])
-
-    if side == "left":
-        while lo < hi:
-            mid = (lo + hi) // 2
-            if tuple(arr[mid] for arr in arrays) < values:
-                lo = mid + 1
-            else:
-                hi = mid
-    elif side == "right":
-        while lo < hi:
-            mid = (lo + hi) // 2
-            if values < tuple(arr[mid] for arr in arrays):
-                hi = mid
-            else:
-                lo = mid + 1
-    else:
-        raise ValueError("side must be 'left' or 'right'")
-
-    return lo
 
 
 def asarray_or_dataset(x):
@@ -619,7 +563,7 @@ def attrs_to_jsonable(attrs):
     out = dict(attrs)
     for k, v in attrs.items():
         try:
-            out[k] = np.asscalar(v)
+            out[k] = v.item()
         except ValueError:
             out[k] = v.tolist()
         except AttributeError:
@@ -627,14 +571,7 @@ def attrs_to_jsonable(attrs):
     return out
 
 
-def unstar(func):
-    def unstarred(args):
-        return func(*args)
-
-    return unstarred
-
-
-def infer_meta(x, index=None):
+def infer_meta(x, index=None):  # pragma: no cover
     """
     Extracted and modified from dask/dataframe/utils.py :
         make_meta (BSD licensed)
@@ -751,7 +688,7 @@ def infer_meta(x, index=None):
 
 def get_meta(
     columns, dtype=None, index_columns=None, index_names=None, default_dtype=np.object
-):
+):  # pragma: no cover
     """
     Extracted and modified from pandas/io/parsers.py :
         _get_empty_meta (BSD licensed).

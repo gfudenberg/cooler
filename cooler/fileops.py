@@ -1,13 +1,10 @@
 # -*- coding: utf-8 -*-
 from __future__ import absolute_import, print_function, division
 from datetime import datetime
-from textwrap import dedent
+# from textwrap import dedent
 import warnings
-import uuid
 import simplejson as json
-
 import os
-
 from six import PY2
 import six
 
@@ -22,9 +19,40 @@ import numpy as np
 import h5py
 
 from .util import parse_cooler_uri, natsorted
-from .create import MAGIC, URL
+from .create import MAGIC, URL, MAGIC_SCOOL
 
 __all__ = ["is_cooler", "is_multires_file", "list_coolers", "cp", "mv", "ln"]
+
+
+def json_dumps(o):
+    """Write JSON in a consistent, human-readable way."""
+    return json.dumps(
+        o, indent=4, sort_keys=True, ensure_ascii=True, separators=(',', ': ')
+    )
+
+
+def json_loads(s):
+    """Read JSON in a consistent way."""
+    return json.loads(s)
+
+
+def decode_attr_value(obj):
+    """Decode a numpy object or HDF5 attribute into a JSONable object"""
+    if hasattr(obj, "item"):
+        o = obj.item()
+    elif hasattr(obj, "tolist"):
+        o = obj.tolist()
+    elif isinstance(obj, six.string_types):
+        try:
+            o = datetime.strptime(obj, "%Y-%m-%dT%H:%M:%S.%f")
+        except ValueError:
+            try:
+                o = json.loads(obj)
+            except JSONDecodeError:
+                o = obj
+    else:
+        o = obj
+    return o
 
 
 class TreeNode(object):
@@ -76,8 +104,7 @@ def visititems(group, func, level=None):
 
 def _is_cooler(grp):
     fmt = grp.attrs.get("format", None)
-    url = grp.attrs.get("format-url", None)
-    if fmt == MAGIC or url == URL:
+    if fmt == MAGIC:
         keys = ("chroms", "bins", "pixels", "indexes")
         if not all(name in grp.keys() for name in keys):
             warnings.warn("Cooler path {} appears to be corrupt".format(grp.name))
@@ -89,7 +116,7 @@ def is_cooler(uri):
     """
     Determine if a URI string references a cooler data collection.
     Returns False if the file or group path doesn't exist.
-
+    
     """
     filepath, grouppath = parse_cooler_uri(uri)
     if not h5py.is_hdf5(filepath):
@@ -110,12 +137,37 @@ def is_multires_file(filepath, min_version=1):
     with h5py.File(filepath) as f:
         fmt = f.attrs.get("format", None)
         if "resolutions" in f.keys() and len(f["resolutions"].keys()) > 0:
-            name = next(list(f["resolutions"].keys()))
+            name = next(iter(f["resolutions"].keys()))
             if fmt == "HDF5::MCOOL" and _is_cooler(f["resolutions"][name]):
                 return True
         elif "0" in f.keys() and _is_cooler(f["0"]) and min_version < 2:
             return True
 
+    return False
+
+
+def is_scool_file(filepath):
+    """
+    Determine if a file is a single-cell cooler file.
+    Returns False if the file doesn't exist.
+
+    """
+    if not h5py.is_hdf5(filepath):
+        raise OSError("'{}' is not an HDF5 file.".format(filepath))
+        return False
+
+    with h5py.File(filepath) as f:
+        fmt = f.attrs.get("format", None)
+        if fmt == MAGIC_SCOOL:
+            keys = ("chroms", "bins", "cells")
+            if not all(name in f.keys() for name in keys):
+                warnings.warn("Scooler path {} appears to be corrupt".format(grp.name))
+                return False
+            if "cells" in f.keys() and len(f["cells"].keys()) > 0:
+                for cells in f["cells"].keys():
+                    if not _is_cooler(f["cells"][cells]):
+                        return False
+                return True
     return False
 
 
@@ -147,6 +199,37 @@ def list_coolers(filepath):
         visititems(f, _check_cooler)
 
     return natsorted(listing)
+
+
+def list_scool_cells(filepath):
+    """
+    List the paths to all single-cell cool matrices in a file scool file.
+
+    Parameters
+    ----------
+    filepath : str
+
+    Returns
+    -------
+    list
+        Cooler group paths of all cells in the file.
+
+    """
+    if is_scool_file(filepath):
+
+        listing = []
+        def _check_cooler(pth, grp):
+            if _is_cooler(grp):
+                listing.append("/" + pth if not pth.startswith("/") else pth)
+        with h5py.File(filepath, "r") as f:
+            _check_cooler("/", f)
+            visititems(f, _check_cooler)
+        if '/' in listing:
+            listing.remove('/')
+        return natsorted(listing)
+    else:
+        raise OSError("'{}' is not a scool file.".format(filepath))
+    return False
 
 
 def ls(uri):
@@ -237,86 +320,49 @@ def ln(src_uri, dst_uri, soft=False, overwrite=False):
     _copy(src_uri, dst_uri, overwrite, link=not soft, rename=False, soft_link=soft)
 
 
-def _tree_html(node, root=False, expand=False):
-    result = ""
-    data_jstree = '{"type": "%s"}' % node.get_type()
-    if root or (expand is True) or (isinstance(expand, int) and node.depth < expand):
-        css_class = "jstree-open"
+######
+# Tree rendering. Borrowed from zarr-python.
+
+
+def _tree_get_icon(stype):
+    if stype in {"Dataset", "Array"}:
+        return 'table'
+    elif stype in {"Group", "File"}:
+        return 'folder'
     else:
-        css_class = ""
-    result += "<li data-jstree='{}' class='{}'>".format(data_jstree, css_class)
-    result += "<span>{}</span>".format(node.get_text())
-    children = node.get_children()
-    if children:
-        result += "<ul>"
-        for child in children:
-            result += _tree_html(child, expand=expand)
-        result += "</ul>"
-    result += "</li>"
+        raise ValueError("Unknown type: %s" % stype)
+
+
+def _tree_widget_sublist(node, root=False, expand=False):
+    import ipytree
+
+    result = ipytree.Node()
+    result.icon = _tree_get_icon(node.get_type())
+    if root or (expand is True) or (isinstance(expand, int) and node.depth < expand):
+        result.opened = True
+    else:
+        result.opened = False
+    result.name = node.get_text()
+    result.nodes = [_tree_widget_sublist(c, expand=expand) for c in node.get_children()]
+    result.disabled = True
+
     return result
 
 
-def tree_html(group, expand, level):
-    tree_group_icon = "fa fa-folder"
-    tree_array_icon = "fa fa-table"
-    # alternatives...
-    # tree_group_icon: 'jstree-folder'
-    # tree_array_icon: 'jstree-file'
+def tree_widget(group, expand, level):
+    try:
+        import ipytree
+    except ImportError as error:
+        raise ImportError(
+            "{}: Run `pip install ipytree` or `conda install ipytree`"
+            "to get the required ipytree dependency for displaying the tree "
+            "widget. If using jupyterlab, you also need to run "
+            "`jupyter labextension install ipytree`".format(error)
+        )
 
-    result = ""
-
-    # include CSS for jstree default theme
-    css_url = (
-        "//cdnjs.cloudflare.com/ajax/libs/jstree/3.3.3/themes/default/style.min.css"
-    )
-    result += '<link rel="stylesheet" href="{}"/>'.format(css_url)
-
-    # construct the tree as HTML nested lists
-    node_id = uuid.uuid4()
-    result += '<div id="{}" class="zarr-tree">'.format(node_id)
-    result += "<ul>"
-
+    result = ipytree.Tree()
     root = TreeNode(group, level=level)
-    result += _tree_html(root, root=True, expand=expand)
-
-    result += "</ul>"
-    result += "</div>"
-
-    # construct javascript
-    result += dedent(
-        """
-        <script>
-            if (!require.defined('jquery')) {
-                require.config({
-                    paths: {
-                        jquery: '//cdnjs.cloudflare.com/ajax/libs/jquery/1.12.1/jquery.min'
-                    },
-                });
-            }
-            if (!require.defined('jstree')) {
-                require.config({
-                    paths: {
-                        jstree: '//cdnjs.cloudflare.com/ajax/libs/jstree/3.3.3/jstree.min'
-                    },
-                });
-            }
-            require(['jstree'], function() {
-                $('#%s').jstree({
-                    types: {
-                        Group: {
-                            icon: "%s"
-                        },
-                        Array: {
-                            icon: "%s"
-                        }
-                    },
-                    plugins: ["types"]
-                });
-            });
-        </script>
-    """
-        % (node_id, tree_group_icon, tree_array_icon)
-    )
+    result.add_node(_tree_widget_sublist(root, root=True, expand=expand))
 
     return result
 
@@ -352,7 +398,10 @@ class TreeViewer(object):
         self.text_kwargs = dict(horiz_len=2, label_space=1, indent=1)
 
         self.bytes_kwargs = dict(
-            UP_AND_RIGHT="+", HORIZONTAL="-", VERTICAL="|", VERTICAL_AND_RIGHT="+"
+            UP_AND_RIGHT="+",
+            HORIZONTAL="-",
+            VERTICAL="|",
+            VERTICAL_AND_RIGHT="+"
         )
 
         self.unicode_kwargs = dict(
@@ -393,39 +442,16 @@ class TreeViewer(object):
         else:  # pragma: py2 no cover
             return self.__unicode__()
 
-    def _repr_html_(self):
-        return tree_html(self.group, expand=self.expand, level=self.level)
-
-
-def pprint_data_tree(uri, level):
-    path, group = parse_cooler_uri(uri)
-    with h5py.File(path, "r") as f:
-        grp = f[group]
-        return repr(TreeViewer(grp, level=level))
-
-
-def _decode_attr_value(obj):
-    if hasattr(obj, "item"):
-        o = np.asscalar(obj)
-    elif hasattr(obj, "tolist"):
-        o = obj.tolist()
-    elif isinstance(obj, six.string_types):
-        try:
-            o = datetime.strptime(obj, "%Y-%m-%dT%H:%M:%S.%f")
-        except ValueError:
-            try:
-                o = json.loads(obj)
-            except JSONDecodeError:
-                o = obj
-    else:
-        o = obj
-    return o
+    def _ipython_display_(self):
+        tree = tree_widget(self.group, expand=self.expand, level=self.level)
+        tree._ipython_display_()
+        return tree
 
 
 def read_attr_tree(group, level):
     def _getdict(node, root=False):
         attrs = node.obj.attrs
-        result = {"@attrs": {k: _decode_attr_value(v) for k, v in attrs.items()}}
+        result = {"@attrs": {k: decode_attr_value(v) for k, v in attrs.items()}}
         children = node.get_children()
         if children:
             for child in children:
@@ -437,7 +463,7 @@ def read_attr_tree(group, level):
 
 def pprint_attr_tree(uri, level):
     import yaml
-    from io import StringIO
+    from six import StringIO
 
     path, group = parse_cooler_uri(uri)
     with h5py.File(path, "r") as f:
@@ -447,31 +473,10 @@ def pprint_attr_tree(uri, level):
         return s.getvalue()
 
 
-# if not h5py.is_hdf5(filepath):
-#     return False
-# if group is None:
-#     return len(ls(filepath)) > 0
-# if not group.startswith('/'):
-#     group = '/' + group
-# return group in ls(filepath)
+def pprint_data_tree(uri, level):
+    path, group = parse_cooler_uri(uri)
+    with h5py.File(path, "r") as f:
+        grp = f[group]
+        return repr(TreeViewer(grp, level=level))
 
-# def has_cooler(uri):
-#     """
-#     Determine if a file contains a valid Cooler data hierarchy.
-
-#     Parameters
-#     ----------
-#     filepath : str
-#     group : str, optional
-#         Path to specific group to check. Otherwise returns True
-#         if any Cooler paths are detected.
-
-#     Returns
-#     -------
-#     bool
-
-#     """
-#     filepath, grouppath = parse_cooler_uri(uri)
-#     if not h5py.is_hdf5(filepath):
-#         return False
-#     return len(list_coolers(uri)) > 0
+######
